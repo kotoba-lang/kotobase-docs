@@ -1,0 +1,74 @@
+#!/usr/bin/env nbb
+;; kotobase-docs の各ファイルが private 原本から drift していないか報告する。
+;;
+;; この repo は「公開コピー」であって正本ではない(README 参照)。コピー方式を
+;; 選んだ以上 drift は必ず起きるので、起きたことを検出できる状態にしておく。
+;;
+;;   nbb sync-check.cljs            ;; 差分のあるファイルを一覧
+;;   nbb sync-check.cljs --diff     ;; 中身の差分も出す
+;;
+;; private repo への読み取り権限が要る(= operator 専用。CI gate にはできない)。
+;; ENTERPRISE-READINESS.md は意図的な redaction があるので、差分が出るのが正常。
+
+(require '[clojure.string :as str])
+
+(def cp (js/require "node:child_process"))
+(def fs (js/require "node:fs"))
+
+(def upstream "network-awai/net-kotobase")
+
+;; ここのファイル名 -> private repo 上の path
+(def mapping
+  {"USING-AS-A-PIN-SERVICE.md" "docs/USING-AS-A-PIN-SERVICE.md"
+   "ENTERPRISE-READINESS.md"   "docs/ENTERPRISE-READINESS.md"
+   "DATA-HANDLING.md"          "docs/DATA-HANDLING.md"
+   "SUPPLY-CHAIN.md"           "docs/SUPPLY-CHAIN.md"
+   "OBSIDIAN.md"               "docs/OBSIDIAN.md"
+   "PLANS.md"                  "docs/PLANS.md"
+   "terms.md"                  "legal/terms.md"})
+
+;; 公開時に意図的に手を入れたファイル。差分ゼロを期待しない。
+(def redacted #{"ENTERPRISE-READINESS.md"})
+
+(def show-diff? (some #{"--diff"} *command-line-args*))
+
+(defn- upstream-text [path]
+  (try
+    (let [b64 (.execFileSync cp "gh"
+                #js ["api" (str "repos/" upstream "/contents/" path) "--jq" ".content"]
+                #js {:encoding "utf8" :maxBuffer 67108864})]
+      (.toString (.from js/Buffer (str/replace (str b64) #"\s" "") "base64") "utf8"))
+    (catch :default e
+      (println "  ! upstream を読めない:" path (str (or (.-message e) "")))
+      nil)))
+
+(defn- norm [s] (-> (or s "") (str/replace #"\r\n" "\n") str/trimr))
+
+(let [results
+      (doall
+        (for [[local remote] (sort mapping)]
+          (let [here (when (.existsSync fs local) (str (.readFileSync fs local "utf8")))
+                there (upstream-text remote)
+                state (cond
+                        (nil? here) :missing-locally
+                        (nil? there) :upstream-unreadable
+                        (= (norm here) (norm there)) :in-sync
+                        (contains? redacted local) :differs-redacted
+                        :else :DRIFT)]
+            (println (format "%-30s %s" local (name state)))
+            (when (and show-diff? (= state :DRIFT))
+              (let [a (str/split-lines (norm there)) b (str/split-lines (norm here))]
+                (doseq [[i [x y]] (map-indexed vector (map vector a b))
+                        :when (not= x y)]
+                  (println "   line" (inc i))
+                  (println "   - upstream:" (subs x 0 (min 100 (count x))))
+                  (println "   + here    :" (subs y 0 (min 100 (count y)))))
+                (when (not= (count a) (count b))
+                  (println "   行数が違う: upstream" (count a) "/ here" (count b)))))
+            state)))
+      drift (count (filter #{:DRIFT} results))]
+  (println)
+  (if (pos? drift)
+    (do (println drift "件が drift している — 原本から取り直すこと")
+        (js/process.exit 1))
+    (println "drift なし(redaction 済みファイルを除く)")))
